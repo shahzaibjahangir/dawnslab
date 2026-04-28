@@ -1,0 +1,43 @@
+# Makefile for CVE-2025-6349/8045 POC
+# Targets: Android 16, Pixel 7/8/9 (r53p0-r54p1)
+
+CC = aarch64-linux-android34-clang
+# Alternative: use ndk clang
+# CC = /path/to/android-ndk-r26b/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang
+
+CFLAGS = -O2 -g -Wall -fPIC
+LDFLAGS = -lpthread -llog
+
+# OpenCL support (needed for some Mali exploits)
+OPENCL_INC = -I$(ANDROID_NDK)/sources/third_party/opencl-headers
+OPENCL_LIB = -lGLES_mali
+
+TARGET = mali_uaf_poc
+SOURCES = poc_cve_2025_6349_8045.c
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCES)
+	$(CC) $(CFLAGS) $(OPENCL_INC) -o $@ $< $(LDFLAGS) $(OPENCL_LIB)
+	@echo "[*] Built: $(TARGET)"
+	@echo "[*] Push to device: adb push $(TARGET) /data/local/tmp/"
+	@echo "[*] Run: adb shell chmod +x /data/local/tmp/$(TARGET)"
+	@echo "[*] Run: adb shell /data/local/tmp/$(TARGET)"
+
+clean:
+	rm -f $(TARGET)
+
+# For testing on rooted Pixel device
+test: $(TARGET)
+	adb push $(TARGET) /data/local/tmp/
+	adb shell chmod +x /data/local/tmp/$(TARGET)
+	adb shell /data/local/tmp/$(TARGET)
+
+dmesg:
+	adb shell dmesg | grep -iE "(kasan|use-after-free|double-free|mali)" | tail -50
+
+logcat:
+	adb logcat -c
+	adb logcat | grep -iE "(mali|gpu|kbase)" 
+
+.PHONY: all clean test dmesg logcat
