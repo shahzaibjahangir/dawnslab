@@ -11,10 +11,12 @@ LDFLAGS = -lpthread -lm -lrt
 
 TARGET = mali_uaf_poc
 TARGET_PIXEL9 = mali_pixel9_poc
+TARGET_STRATEGY3 = poc_strategy3
 SOURCES = poc_cve_2025_6349_8045.c
 SOURCES_PIXEL9 = poc_cve_pixel9.c
+SOURCES_STRATEGY3 = poc_strategy3.c
 
-all: $(TARGET) $(TARGET_PIXEL9)
+all: $(TARGET) $(TARGET_PIXEL9) $(TARGET_STRATEGY3)
 
 $(TARGET): $(SOURCES)
 	@echo "[*] Building generic POC with $(CC)..."
@@ -30,25 +32,32 @@ $(TARGET_PIXEL9): $(SOURCES_PIXEL9)
 	@echo "[*] Push: adb push $@ /data/local/tmp/"
 	@echo "[*] Run:  adb shell chmod +x /data/local/tmp/$@ && adb shell /data/local/tmp/$@ 3071"
 
-clean:
-	rm -f $(TARGET) $(TARGET_PIXEL9)
+$(TARGET_STRATEGY3): $(SOURCES_STRATEGY3)
+	@echo "[*] Building Strategy 3 (GPU Hang) POC with $(CC)..."
+	$(CC) $(CFLAGS) -o $@ $< -ldl -lpthread
+	@echo "[*] Built: $@ ($(shell du -h $@ | cut -f1))"
+	@echo "[*] Push: adb push $@ /data/local/tmp/"
+	@echo "[*] Run:  adb shell chmod +x /data/local/tmp/$@ && adb shell /data/local/tmp/$@"
 
-test: $(TARGET_PIXEL9)
-	@echo "[*] Deploying to device..."
-	adb push $(TARGET_PIXEL9) /data/local/tmp/
-	adb shell chmod +x /data/local/tmp/$(TARGET_PIXEL9)
-	@echo "[*] Running exploit (3071ms stall)..."
-	adb shell /data/local/tmp/$(TARGET_PIXEL9) 3071
+clean:
+	rm -f $(TARGET) $(TARGET_PIXEL9) $(TARGET_STRATEGY3)
+
+test: $(TARGET_STRATEGY3)
+	@echo "[*] Deploying Strategy 3 to device..."
+	adb push $(TARGET_STRATEGY3) /data/local/tmp/
+	adb shell chmod +x /data/local/tmp/$(TARGET_STRATEGY3)
+	@echo "[*] Running GPU hang exploit..."
+	adb shell /data/local/tmp/$(TARGET_STRATEGY3)
 
 check-dmesg:
 	@echo "[*] Checking dmesg for UAF indicators..."
 	adb shell dmesg | grep -iE "(kasan|use-after-free|double-free|slob|slab|mali|kbase)" | tail -100 || true
 
-verify: $(TARGET_PIXEL9)
-	@echo "[*] Running full test sequence..."
-	adb push $(TARGET_PIXEL9) /data/local/tmp/
-	adb shell chmod +x /data/local/tmp/$(TARGET_PIXEL9)
-	adb shell /data/local/tmp/$(TARGET_PIXEL9) 3071 || true
+verify: $(TARGET_STRATEGY3)
+	@echo "[*] Running full Strategy 3 test sequence..."
+	adb push $(TARGET_STRATEGY3) /data/local/tmp/
+	adb shell chmod +x /data/local/tmp/$(TARGET_STRATEGY3)
+	adb shell /data/local/tmp/$(TARGET_STRATEGY3) || true
 	@echo ""
 	@echo "[*] Dmesg output:"
 	adb shell dmesg | tail -200 | grep -iE "(kasan|use-after-free|double-free|slob|slab|mali|kbase)" || echo "(no indicators found)"
