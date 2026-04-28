@@ -1,3 +1,78 @@
+## Critical Bug Fix: Mali Memory Allocation Flags
+
+### The Bug
+
+Our code defined `BASE_MEM_SAME_VA` as `0x1`. This was **WRONG**.
+
+From the actual Mali kernel headers (`mali_base_common_kernel.h`):
+
+```c
+#define BASE_MEM_PROT_CPU_RD  ((base_mem_alloc_flags)1 << 0)  /* 0x1 */
+#define BASE_MEM_PROT_CPU_WR  ((base_mem_alloc_flags)1 << 1)  /* 0x2 */
+#define BASE_MEM_PROT_GPU_RD  ((base_mem_alloc_flags)1 << 2)  /* 0x4 */
+#define BASE_MEM_PROT_GPU_WR  ((base_mem_alloc_flags)1 << 3)  /* 0x8 */
+#define BASE_MEM_SAME_VA      ((base_mem_alloc_flags)1 << 13) /* 0x2000 */
+```
+
+### What Happened
+
+- Our code: `flags = BASE_MEM_SAME_VA` (which we thought was `0x1`)
+- Actual value sent: `0x1` = `BASE_MEM_PROT_CPU_RD` only
+- Kernel saw: `0x1` without `PROT_GPU_RD|PROT_GPU_WR` = invalid
+- dmesg: `kbase_mem_alloc called with bad flags (0x2001)` when we tried `SAME_VA | CPU_RD`
+
+### The Fix
+
+The correct minimal flags for `kbase_mem_alloc` are:
+
+```c
+#define MEM_ALLOC_FLAGS (BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | \
+                         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR)  /* 0xF */
+```
+
+This is `0x0F` — which is exactly what worked in the first POC test (returned VA `0x41000`).
+
+**Add `BASE_MEM_SAME_VA` (0x2000) only when you need CPU-accessible GPU memory.**
+
+---
+
+## Test Results (Pixel 9 Tokay, r54p0)
+
+### Previous Run (BEFORE flag fix)
+
+**Command:** `./poc7pm` (mali_pixel9_poc with bad flags)
+
+**dmesg:**
+```
+mali: kbase_mem_alloc called with bad flags (18340f)
+mali: Unknown ioctl 0x40108004 nr:4
+```
+
+**Issues:**
+- `0x18340f` = `0x0F | 0x2000 | (1<<19) | (1<<20)` — invalid KBASE_REG flags
+- `0x40108004` = MEM_COMMIT ioctl — not exported
+
+### Strategy 3 Run (BEFORE flag fix)
+
+**Command:** `./poc_strategy3`
+
+**dmesg:**
+```
+mali: kbase_mem_alloc called with bad flags (2001)
+```
+
+**Issues:**
+- `0x2001` = `SAME_VA | CPU_RD` — missing GPU protection flags
+- Our `BASE_MEM_SAME_VA = 0x1` was WRONG, real value is `0x2000`
+
+### After Fix
+
+**Correct flags:** `0x0F` = `CPU_RD | CPU_WR | GPU_RD | GPU_WR`
+
+This was verified working in the first POC test (VA `0x41000` returned).
+
+---
+
 ## Final Assessment
 
 ### What Was Accomplished

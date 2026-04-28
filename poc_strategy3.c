@@ -43,7 +43,14 @@ typedef int32_t  s32;
 #define KBASE_IOCTL_SET_FLAGS          _IOW(KBASE_IOCTL_TYPE, 1, struct kbase_ioctl_set_flags)
 #define KBASE_IOCTL_MEM_ALLOC          _IOWR(KBASE_IOCTL_TYPE, 5, union kbase_ioctl_mem_alloc)
 
-#define BASE_MEM_SAME_VA  0x1
+#define BASE_MEM_PROT_CPU_RD  (1u << 0)  /* 0x1 */
+#define BASE_MEM_PROT_CPU_WR  (1u << 1)  /* 0x2 */
+#define BASE_MEM_PROT_GPU_RD  (1u << 2)  /* 0x4 */
+#define BASE_MEM_PROT_GPU_WR  (1u << 3)  /* 0x8 */
+#define BASE_MEM_SAME_VA      (1u << 13) /* 0x2000 */
+
+#define MEM_ALLOC_FLAGS (BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | \
+                         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR)  /* 0xF */
 
 struct kbase_ioctl_version_check { u16 major; u16 minor; };
 struct kbase_ioctl_set_flags { u32 create_flags; };
@@ -404,7 +411,7 @@ static u64 mali_mem_alloc(int fd) {
     union kbase_ioctl_mem_alloc req = {0};
     req.in.va_pages = 1;
     req.in.commit_pages = 1;
-    req.in.flags = BASE_MEM_SAME_VA;
+    req.in.flags = MEM_ALLOC_FLAGS;
     req.in.extension = 0;
     if (ioctl(fd, KBASE_IOCTL_MEM_ALLOC, &req) < 0) {
         return 0;
