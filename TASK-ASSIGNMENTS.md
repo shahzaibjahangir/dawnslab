@@ -1,15 +1,15 @@
 # Shaby's Tech House — Task Assignments
 ## CVE-2025-6349 / CVE-2025-8045 Exploitation
 
-**Project Status:** Updated - 2026-04-28  
-**Last Update:** Improved race trigger, added commit-with-0 alternative to blocked ioctls
+**Project Status:** Updated - 2026-04-30  
+**Last Update:** Fixed dlopen + EGL loading, confirmed GPU hang blocker, documented remaining paths
 
 ### Quick Reference
 
 | Task ID | Title | Assignee | Priority | Status | ETA |
 |---------|-------|----------|----------|--------|-----|
-| T-001 | POC Race Condition Implementation | Jax (CODER) | critical | 🔄 in_progress | 2 days |
-| T-002 | GPU Memory Mapping Analysis | Rhea (CODER) | critical | ⏳ pending | 3 days |
+| T-001 | POC Race Condition Implementation | Jax (CODER) | critical | 🚧 blocked | 2 days |
+| T-002 | GPU Memory Mapping Analysis | Rhea (CODER) | critical | ✅ completed | 3 days |
 | T-003 | Kernel Debugging & UAF Validation | Silas (DEBUGGER) | critical | ⏳ pending | 4 days |
 | T-004 | Page Table Manipulation Primitive | Vega (RE) | high | ⏳ pending | 5 days |
 | T-005 | Full Exploit Integration | Orion (RE) | high | ⏳ pending | 7 days |
@@ -20,14 +20,30 @@
 
 **Assigned to:** Jax (CODER)  
 **Priority:** critical  
-**Status:** in_progress  
+**Status:** 🚧 blocked — GPU hang not achievable from unprivileged userspace
 
-#### Updates (2026-04-28)
+#### Updates (2026-04-30)
 
-- Fixed `extension` field bug for r54p0 (MUST be 0, not GPU VA)
-- Added `gpu_free_via_commit()` as alternative to blocked ioctl 6 (MEM_FREE)
-- Improved race trigger with CQS_WAIT + fence_signal fallback
-- Added KCPU_QUEUE_WAIT support for better race coordination
+- **FIXED:** dlopen/libEGL loading — NDK build + dependency preload chain
+- **FIXED:** Cookie exhaustion — separate FDs per strike thread
+- **CONFIRMED:** KCPU queue creation works (ioctl 45, id=0)
+- **CONFIRMED:** SSBO + barrier-deadlock shader compiles and dispatches
+- **BLOCKED:** Mali G715 preempts ALL compute shaders (mid-frame preemption)
+- **BLOCKED:** munmap SSBO while shader runs doesn't cause GPU hang
+- **DISCOVERED:** `/sys/class/misc/mali0/device/trigger_fw_fault` can force CSF hang, but requires root
+- **STRATEGY 3 VIABILITY DOWNGRADED:** ~20% from unprivileged (was 60-80%)
+
+#### Blocker Details
+
+The Arm Mali G715 GPU implements hardware mid-frame preemption. The CSF firmware
+monitors shader execution and terminates any shader exceeding its time slice.
+This means NO compute shader can run long enough to trigger the 3s CSF watchdog
+that calls `kbasep_csf_cpu_queue_dump_print()`.
+
+To trigger the CSF hang needed for the race, we need one of:
+1. Root access → `trigger_fw_fault` sysfs → forces real CSF firmware hang
+2. Custom kernel (Strategy 1) → debug ioctls re-enabled
+3. Vulkan compute (untested) → may use different submission path
 - Built optimized static binaries for Pixel 9 (r54p0)
 
 #### Inputs
